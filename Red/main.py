@@ -20,14 +20,16 @@ time_train = 30 * 60
 class PolicyNetwork(tf.keras.Model):
     def __init__(self):
         super(PolicyNetwork, self).__init__()
-        self.dense1 = tf.keras.layers.Dense(256, activation='relu')  # Hidden layer
-        self.dense2 = tf.keras.layers.Dense(256, activation='relu')  # Hidden layer
-        self.dense3 = tf.keras.layers.Dense(8, activation='softmax')  # Output layer (8 actions)
+        self.dense1 = tf.keras.layers.Dense(64, activation='relu')  # Hidden layer
+        self.dense2 = tf.keras.layers.Dense(1024, activation='relu')  # Hidden layer
+        self.dense3 = tf.keras.layers.Dense(256, activation='relu')  # Hidden layer
+        self.dense4 = tf.keras.layers.Dense(8, activation='softmax')  # Output layer (8 actions)
 
     def call(self, inputs):
         x = self.dense1(inputs)
         x = self.dense2(x)
-        return self.dense3(x)
+        x = self.dense3(x)
+        return self.dense4(x)
 
 
 # Function to normalize rewards
@@ -106,7 +108,7 @@ def train(policy, optimizer, episodes=1000):
 
         start_time = time.process_time()
 
-        pyboy = PyBoy('red.gb', window='null')
+        pyboy = PyBoy('red.gb')
         pyboy.set_emulation_speed(0)
 
         with open("has_pokedex_nballs.state", "rb") as f:
