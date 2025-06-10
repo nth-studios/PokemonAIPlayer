@@ -1,225 +1,181 @@
+# multi_threaded_pokemon_train.py
+from PIL import Image
+import concurrent.futures
 import random
-import time
-from collections import Counter
-
-from pytesseract import pytesseract
-from pyboy import PyBoy
-import tensorflow as tf
 import numpy as np
-import math
+import tensorflow as tf
+from pyboy import PyBoy
+import cv2
 
+# --- CONFIGURATION ---
+NUM_EPISODES = 40
+NUM_WORKERS = 4
+MAX_STEPS = 3600
+RAND_CHANCE = 0.05
+SKIP_FRAMES = 24  # emulate every SKIP_FRAMES ticks
 
-# Hyperparameters
-learning_rate = 0.005
-gamma = 0.99  # Discount factor for future rewards
-rand_chance = 0.05
-time_train = 30 * 60 * 2
+# --- UTILITY FUNCTIONS ---
 
+def preprocess_image(pyboy):
+    """Capture screen from PyBoy and return (84, 84, 1) normalized grayscale numpy array."""
+    try:
+        # Get the screen as a PIL image
+        img = pyboy.screen.image
+
+        # Force convert to RGB if not already
+        if not isinstance(img, Image.Image):
+            raise TypeError(f"Expected PIL.Image, got {type(img)}")
+        img = img.convert("RGB")
+
+        # Convert to numpy array
+        np_img = np.asarray(img)
+        if np_img.ndim != 3 or np_img.shape[2] != 3:
+            raise ValueError(f"Invalid image shape: {np_img.shape}")
+
+        # Convert RGB -> Grayscale
+        gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+
+        # Resize to (84x84)
+        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+
+        # Normalize to [0,1]
+        normalized = resized.astype(np.float32) / 255.0
+
+        # Add channel dimension: (84, 84, 1)
+        return np.expand_dims(normalized, axis=-1)
+
+    except Exception as e:
+        print(f"[preprocess_image ERROR] {e}")
+        raise
+
+def get_memory_state(pyboy):
+    """Extract memory-based features for Pokémon + location + menu."""
+    def m(addr): return pyboy.memory[addr]
+    def get_mon(addr):
+        return [
+            m(addr + offset) for offset in (
+                0, 33, 1, 4, 5, 6, 8, 9, 10, 11, 29, 30, 31, 32
+            )
+        ]
+    mons = []
+    for base in [0xD16B, 0xD197, 0xD1C3, 0xD1EF]:
+        mons += get_mon(base)
+    mons += [m(0xD35E), m(0xD362), m(0xD361), m(0xD057), m(0xCC26)]
+    return np.array(mons, dtype=np.float32) / 255.0  # shape: (89,)
+
+def compute_reward(pyboy, visited):
+    """Combine level-sum and exploration reward."""
+    levels = sum(get_memory_state(pyboy)[i] for i in range(4 * 2))  # first 8 entries approximate levels
+    pos = tuple(get_memory_state(pyboy)[-5:-2])
+    visited.add(pos)
+    return levels + 0.1 * len(visited)
+
+def discount_rewards(xs, gamma=0.99):
+    """Standard discounted reward (REINFORCE)."""
+    ds = np.zeros_like(xs, dtype=np.float32)
+    g = 0.0
+    for i in reversed(range(len(xs))):
+        g = xs[i] + gamma * g
+        ds[i] = g
+    return ds
+
+def log_prob_from_logits(logits, actions):
+    """Compute log-probs for selected actions."""
+    neglog = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=actions)
+    return -neglog
+
+# --- MODEL DEFINITION ---
 
 class PolicyNetwork(tf.keras.Model):
     def __init__(self):
-        super(PolicyNetwork, self).__init__()
-        self.dense1 = tf.keras.layers.Dense(128, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(1024, activation='relu')
-        self.dense3 = tf.keras.layers.Dense(64, activation='relu')
-        self.dense4 = tf.keras.layers.Dense(8)  # logits output
+        super().__init__()
+        # CNN branch
+        self.conv1 = tf.keras.layers.Conv2D(16, 8, strides=4, activation='relu')
+        self.conv2 = tf.keras.layers.Conv2D(32, 4, strides=2, activation='relu')
+        self.flat = tf.keras.layers.Flatten()
+        # Memory branch
+        self.mem_dense = tf.keras.layers.Dense(128, activation='relu')
+        # Combined branch
+        self.comb_dense = tf.keras.layers.Dense(256, activation='relu')
+        self.logits = tf.keras.layers.Dense(8)
 
-    def call(self, inputs):
-        x = self.dense1(inputs)
-        x = self.dense2(x)
-        x = self.dense3(x)
-        return self.dense4(x)
+    def call(self, img, mem):
+        x1 = self.conv1(tf.expand_dims(img, -1))
+        x1 = self.conv2(x1)
+        x1 = self.flat(x1)
+        x2 = self.mem_dense(mem)
+        x = self.comb_dense(tf.concat([x1, x2], axis=1))
+        return self.logits(x)
 
+# --- EPISODE RUNNER ---
 
-# Function to normalize rewards
-def normalize_rewards(rewards):
-    rewards = np.array(rewards)
-    rewards -= np.mean(rewards)
-    rewards /= (np.std(rewards) + 1e-10)  # Avoid division by zero
-    return rewards
+def run_episode(agent, ep_id):
+    pyboy = PyBoy('red.gb')
+    pyboy.set_emulation_speed(0)
+    with open("has_pokedex_nballs.state", "rb") as f:
+        pyboy.load_state(f)
+    pyboy.game_wrapper.start_game()
 
+    visited = set()
+    log = []
+    total_reward = 0.0
 
-# Discount rewards function (unchanged)
-def discount_rewards(rewards, gamma):
-    discounted_rewards = np.zeros_like(rewards)
-    cumulative = 0
-    for t in reversed(range(len(rewards))):
-        cumulative = cumulative * gamma + rewards[t]
-        discounted_rewards[t] = cumulative
-    return normalize_rewards(discounted_rewards)
+    for step in range(MAX_STEPS):
+        img = preprocess_image(pyboy)
+        mem = get_memory_state(pyboy).reshape(1, -1)
+        logits = agent(img.reshape(1,84,84), mem)
+        probs = tf.nn.softmax(logits).numpy()[0]
+        action = np.random.choice(8, p=probs)
+        if random.random() < RAND_CHANCE:
+            action = random.randint(0,7)
+        log_prob = log_prob_from_logits(logits, np.array([action]))[0].numpy()
 
+        pyboy.tick(SKIP_FRAMES)
+        pyboy.button(["a","b","start","select","left","right","up","down"][action], 12)
 
-class Mon:
-    def __init__(self, dex_no, level, hp, status, type1, type2, move1, move2, move3, move4, pp_move1, pp_move2,
-                 pp_move3, pp_move4):
-        self.dex_no = dex_no
-        self.level = level
-        self.hp = hp
-        self.status = status
-        self.type1 = type1
-        self.type2 = type2
-        self.move1 = move1
-        self.move2 = move2
-        self.move3 = move3
-        self.move4 = move4
-        self.pp_move1 = pp_move1
-        self.pp_move2 = pp_move2
-        self.pp_move3 = pp_move3
-        self.pp_move4 = pp_move4
+        reward = compute_reward(pyboy, visited)
+        total_reward += reward
+        log.append((img, mem.squeeze(), action, log_prob, reward))
 
-    def __str__(self):
-        return "ID: " + str(self.dex_no) + ", Lvl: " + str(self.level)
+    pyboy.stop()
+    imgs, mems, acts, lps, rews = zip(*log)
+    return dict(
+        ep_id=ep_id, total_reward=total_reward,
+        states=(np.stack(imgs), np.stack(mems)),
+        actions=np.array(acts, dtype=np.int32),
+        old_log_probs=np.array(lps, dtype=np.float32),
+        rewards=discount_rewards(rews)
+    )
 
+# --- TRAINING LOOP ---
 
-def get_mem(env, addr):
-    return env.memory[addr]
+def train():
+    agent = PolicyNetwork()
+    optimizer = tf.keras.optimizers.Adam(3e-4)
 
+    for ep in range(NUM_EPISODES):
+        episodes = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
+            futures = [ex.submit(run_episode, agent, f"{ep}_{i}") for i in range(NUM_WORKERS)]
+            for future in concurrent.futures.as_completed(futures):
+                episodes.append(future.result())
 
-def get_pokemon(env, addr):
-    dex_no = get_mem(env, addr)
-    hp1 = get_mem(env, addr + 1)
-    hp2 = get_mem(env, addr + 2)
-    status = get_mem(env, addr + 4)
-    type1 = get_mem(env, addr + 5)
-    type2 = get_mem(env, addr + 6)
-    move1 = get_mem(env, addr + 8)
-    move2 = get_mem(env, addr + 9)
-    move3 = get_mem(env, addr + 10)
-    move4 = get_mem(env, addr + 11)
-    pp_move1 = get_mem(env, addr + 29)
-    pp_move2 = get_mem(env, addr + 30)
-    pp_move3 = get_mem(env, addr + 31)
-    pp_move4 = get_mem(env, addr + 32)
-    level = get_mem(env, addr + 33)
+        best = max(episodes, key=lambda x: x["total_reward"])
+        print(f"Ep {ep}: Best Reward={best['total_reward']:.1f} ({best['ep_id']})")
 
-    return Mon(dex_no, level, hp1 << 8 + hp2, status, type1, type2, move1, move2, move3, move4, pp_move1, pp_move2,
-               pp_move3, pp_move4)
-
-
-
-
-outputs = ["a", "b", "start", "select", "left", "right", "up", "down"]
-
-times = []
-# Train Policy Gradient
-def train(policy, optimizer, episodes=1000):
-    for episode in range(episodes):
-
-        start_time = time.process_time()
-
-        pyboy = PyBoy('red.gb')
-        pyboy.set_emulation_speed(0)
-
-        with open("has_pokedex_nballs.state", "rb") as f:
-            pyboy.load_state(f)
-
-        red = pyboy.game_wrapper
-        red.start_game()
-
-        count = 0
-        random.seed(time.process_time())
-
-        squares = set()
-
-        states, actions, rewards = [], [], []
-        total_reward = 0
-
-        while count < time_train:
-            # Setup state
-            mon1 = get_pokemon(pyboy, 0xD16B)
-            mon2 = get_pokemon(pyboy, 0xD197)
-            mon3 = get_pokemon(pyboy, 0xD1C3)
-            mon4 = get_pokemon(pyboy, 0xD1EF)
-            mon5 = get_pokemon(pyboy, 0xD21B)
-            mon6 = get_pokemon(pyboy, 0xD247)
-
-            sq_x = pyboy.memory[0xD362]
-            sq_y = pyboy.memory[0xD361]
-            sq_m = pyboy.memory[0xD35E]
-            in_battle = get_mem(pyboy, 0xD057)
-            menu_item = get_mem(pyboy, 0xCC26)
-
-            squares.add((sq_m, sq_x, sq_y))
-
-            state = np.array([mon1.level, mon1.dex_no, mon1.hp, mon1.type1, mon1.type2, mon1.status,
-                     mon1.move1, mon1.move2, mon1.move3, mon1.move4,
-                     mon1.pp_move1, mon1.pp_move2, mon1.pp_move3, mon1.pp_move4,
-                     mon2.level, mon2.dex_no, mon2.hp, mon2.type1, mon2.type2, mon2.status,
-                     mon2.move1, mon2.move2, mon2.move3, mon2.move4,
-                     mon2.pp_move1, mon2.pp_move2, mon2.pp_move3, mon2.pp_move4,
-                     mon3.level, mon3.dex_no, mon3.hp, mon3.type1, mon3.type2, mon3.status,
-                     mon3.move1, mon3.move2, mon3.move3, mon3.move4,
-                     mon3.pp_move1, mon3.pp_move2, mon3.pp_move3, mon3.pp_move4,
-                     mon4.level, mon4.dex_no, mon4.hp, mon4.type1, mon4.type2, mon4.status,
-                     mon4.move1, mon4.move2, mon4.move3, mon4.move4,
-                     mon4.pp_move1, mon4.pp_move2, mon4.pp_move3, mon4.pp_move4,
-                     sq_m, sq_x, sq_y, in_battle, menu_item])
-
-            state = state / 255.0
-            state = state.reshape(1, len(state))
-            states.append(state)
-
-            # Get next action
-
-            action_logits = policy(state)
-            action_prob = tf.nn.softmax(action_logits).numpy()[0]
-            action = np.random.choice(8, p=action_prob)
-            action = np.random.choice([action, np.random.choice(8)], p=[1-rand_chance, rand_chance])
-            actions.append(action)
-
-            pyboy.tick(24)
-
-            level_reward = mon1.level + mon2.level + mon3.level + mon4.level + mon5.level + mon6.level - 5
-            exploration_reward = len(squares) * 0.1
-
-            reward = level_reward + exploration_reward
-            # if len(actions) > 1 and actions[-1] == actions[-2]:
-            #     reward -= 0.2  # or some small penalty
-
-            rewards.append(reward)
-            total_reward = reward
-
-            pyboy.button(outputs[action], 12)
-            count = count + 1
-
-            if count == time_train:
-                # print("Logits:", np.round(action_logits.numpy()[0], 2))
-                print("Probs :", np.round(action_prob, 2))
-
-        states = np.vstack(states)
-        actions = np.array(actions)
-        rewards = discount_rewards(rewards, gamma)
-
+        imgs, mems = best["states"]
+        acts, old_lps, rews = best["actions"], best["old_log_probs"], best["rewards"]
+        # train batch
         with tf.GradientTape() as tape:
-            logits = policy(states)
-            action_probs = tf.nn.softmax(logits)
-            entropy = -tf.reduce_sum(action_probs * tf.math.log(action_probs + 1e-10), axis=1)
-            log_probs = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=actions)
-            loss = tf.reduce_mean(log_probs * rewards - 0.01 * entropy)  # Encourage randomness
+            logits = agent(imgs, mems)
+            lp = log_prob_from_logits(logits, acts)
+            loss = -tf.reduce_mean(lp * rews)
+        grads = tape.gradient(loss, agent.trainable_variables)
+        optimizer.apply_gradients(zip(grads, agent.trainable_variables))
 
-        # Apply gradients to update the network
-        grads = tape.gradient(loss, policy.trainable_variables)
-        grads, _ = tf.clip_by_global_norm(grads, 1.0)
-        optimizer.apply_gradients(zip(grads, policy.trainable_variables))
+    agent.save_weights("best_policy.h5")
+    print("Training complete.")
 
-        # Print progress
-        print(f"Episode {episode + 1}, Total Reward: {total_reward}")
-        # for i in range(8):
-        #     print(outputs[i], Counter(actions)[i])
-
-        pyboy.stop()
-        time_taken = time.process_time()-start_time
-        print(f"Time for episode {episode + 1} - {time_taken}")
-        times.append(time_taken)
-
-        episode_entropy = tf.reduce_mean(entropy).numpy()
-        print(f"Episode {episode + 1}, Avg Entropy: {episode_entropy:.4f}")
-        print()
-
-
-policy = PolicyNetwork()
-optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-
-# Train the policy agent
-train(policy, optimizer, episodes=500)
-
+# Run if executed
+if __name__ == "__main__":
+    train()
